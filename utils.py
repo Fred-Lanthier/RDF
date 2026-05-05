@@ -83,10 +83,13 @@ def eval_chamfer_distance(tag):
     cd_mean,cd_max =np.mean(res,axis=0)
     return cd_mean,cd_max
 
-def visualize_reconstructed_whole_body(model, trans_list,tag):
-    mesh_path = os.path.join(CUR_DIR,f"output_meshes/{tag}_*.stl")
-    mesh_files = glob.glob(mesh_path)
-    mesh_files.sort()
+def visualize_reconstructed_whole_body(model, trans_list, tag, mesh_names=None):
+    if mesh_names is None:
+        mesh_path = os.path.join(CUR_DIR,f"output_meshes/{tag}_*.stl")
+        mesh_files = glob.glob(mesh_path)
+        mesh_files.sort()
+    else:
+        mesh_files = [os.path.join(CUR_DIR,f"output_meshes/{tag}_{name}.stl") for name in mesh_names]
     view_mat = np.array([[1,0,0,0],[0,0,1,0],[0,-1,0,0],[0,0,0,1]])
     scene = trimesh.Scene()
     for i,mf in enumerate(mesh_files):

@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import time
 import bf_sdf,nn_sdf,sphere
-from panda_layer.panda_layer import PandaLayer
+from urdf_layer import URDFLayer
 import argparse
 import utils
 import yaml
@@ -26,20 +26,22 @@ if  __name__ =='__main__':
     parser.add_argument('--type', default='RDF', type=str)
     parser.add_argument('--vis', action='store_true')
     parser.add_argument('--vis_rec_robot_surface', action='store_true')
+    parser.add_argument('--urdf_path', default='./collision_avoidance_example/panda_urdf/panda.urdf', type=str)
+    parser.add_argument('--voxel_dir', default='./panda_layer/meshes/voxel_128', type=str)
     args = parser.parse_args()
 
     data = np.load(f'./data/sdf_points/test_data.npy',allow_pickle=True).item()
-    panda = PandaLayer(args.device)
+    robot_layer = URDFLayer(urdf_path=args.urdf_path, device=args.device, voxel_dir=args.voxel_dir)
 
     if args.method == 'BP_8':
-        bpSdf = bf_sdf.BPSDF(8,-1,1,panda,args.device)
-        model = torch.load(f'models/{args.method}.pt')
+        bpSdf = bf_sdf.BPSDF(8,-1,1,robot_layer,args.device)
+        model = torch.load(f'models/{args.method}.pt', weights_only=False)
     elif args.method == 'BP_24':
-        bpSdf = bf_sdf.BPSDF(24,-1,1,panda,args.device)
-        model = torch.load(f'models/{args.method}.pt')
+        bpSdf = bf_sdf.BPSDF(24,-1,1,robot_layer,args.device)
+        model = torch.load(f'models/{args.method}.pt', weights_only=False)
     elif args.method == 'NN_LD' or args.method == 'NN_AD':
-        nnSdf = nn_sdf.NNSDF(panda,device=args.device)
-        model = torch.load(f'models/{args.method}.pt')
+        nnSdf = nn_sdf.NNSDF(robot_layer,device=args.device)
+        model = torch.load(f'models/{args.method}.pt', weights_only=False)
     elif args.method == 'Sphere':
         sphere_sdf = sphere.SphereSDF(args.device)
         with open(os.path.join(CUR_DIR,'panda_layer/franka_sphere.yaml'), 'r') as f:
@@ -89,7 +91,6 @@ if  __name__ =='__main__':
         # eval time
         t = []
         x = torch.rand(1024,3).to(args.device)*2.0 - 1.0
-        panda = PandaLayer(args.device)
         theta = torch.rand(1,7).to(args.device).float()
         pose = torch.from_numpy(np.identity(4)).unsqueeze(0).to(args.device).expand(len(theta),4,4).float()
         for _ in range(100):
@@ -107,7 +108,5 @@ if  __name__ =='__main__':
     if args.vis_rec_robot_surface:
         theta = torch.tensor([0, -0.3, 0, -2.2, 0, 2.0, np.pi/4]).float().to(args.device).reshape(-1,7)
         pose = torch.from_numpy(np.identity(4)).to(args.device).reshape(-1, 4, 4).expand(len(theta),4,4).float()
-        trans_list = panda.get_transformations_each_link(pose,theta)
-        utils.visualize_reconstructed_whole_body(model, trans_list, tag=args.method)
-
-    
+        trans_list = robot_layer.get_transformations_each_link(pose,theta)
+        utils.visualize_reconstructed_whole_body(model, trans_list, tag=args.method, mesh_names=robot_layer.get_mesh_names())

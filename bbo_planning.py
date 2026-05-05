@@ -9,8 +9,10 @@ import torch
 import trimesh
 import numpy as np
 import math
-from panda_layer.panda_layer import PandaLayer
+import mesh_to_sdf
+from urdf_layer import URDFLayer
 import bf_sdf
+import argparse
 
 class BBOPlanner():
     def __init__(self, n_func,domain_min,domain_max,robot,device):
@@ -22,7 +24,7 @@ class BBOPlanner():
         self.theta_max = self.robot.theta_max_soft
         self.theta_min = self.robot.theta_min_soft
         self.bp_sdf = bf_sdf.BPSDF(n_func,domain_min,domain_max,robot,device)
-        self.model = torch.load(f'models/BP_8.pt')
+        self.model = torch.load(f'models/BP_8.pt', weights_only=False)
         self.object_mesh = self.load_box_object()
         self.object_internal_points = self.compute_internal_points(num=5,use_surface_points=False)
         self.contact_points = self.compute_contact_points()
@@ -85,7 +87,7 @@ class BBOPlanner():
 
     def reaching_cost(self,pose, theta,p):
         B = theta.shape[0]
-        sdf, joint_grad = self.bp_sdf.get_whole_body_sdf_with_joints_grad_batch(p, pose, theta, self.model,used_links=[5,6,7,8])
+        sdf, joint_grad = self.bp_sdf.get_whole_body_sdf_with_joints_grad_batch(p, pose, theta, self.model,used_links=[5,6,7,8,9])
         sdf, joint_grad = sdf.squeeze(0), joint_grad.squeeze(0)
         # reaching multiple points
         dist = sdf.mean(dim=1)
@@ -95,7 +97,7 @@ class BBOPlanner():
 
     def collision_cost(self,pose,theta,p):
         B = theta.shape[0]
-        sdf, joint_grad = self.bp_sdf.get_whole_body_sdf_with_joints_grad_batch(p, pose, theta, self.model,used_links=[5,6,7,8])
+        sdf, joint_grad = self.bp_sdf.get_whole_body_sdf_with_joints_grad_batch(p, pose, theta, self.model,used_links=[5,6,7,8,9])
         sdf, joint_grad = sdf.squeeze(), joint_grad.squeeze()
         coll_mask = sdf<0
         sdf[~coll_mask] = 0
@@ -108,7 +110,7 @@ class BBOPlanner():
     def normal_cost(self,pose, theta,p,tgt_normal):
         B = theta.shape[0]
         delta = 0.001
-        normal = self.bp_sdf.get_whole_body_normal_with_joints_grad_batch(p, pose, theta, self.model,used_links=[5,6,7,8])
+        normal = self.bp_sdf.get_whole_body_normal_with_joints_grad_batch(p, pose, theta, self.model,used_links=[5,6,7,8,9])
         tgt_normal = tgt_normal.unsqueeze(1).unsqueeze(0).expand_as(normal)
         cosine_similarities = 1 - torch.sum(normal*tgt_normal,dim=-1)
         cost = cosine_similarities[:,:,0].mean(dim=1)
@@ -185,9 +187,14 @@ class BBOPlanner():
         return valid_theta_list
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--urdf_path', default='./collision_avoidance_example/panda_urdf/panda.urdf', type=str)
+    parser.add_argument('--voxel_dir', default='./panda_layer/meshes/voxel_128', type=str)
+    args = parser.parse_args()
+    
     device = 'cuda'
-    panda = PandaLayer(device,mesh_path = "panda_layer/meshes/visual/*.stl")
-    bbo_planner = BBOPlanner(n_func=8,domain_min=-1.0,domain_max=1.0,robot=panda,device=device)
+    robot_layer = URDFLayer(urdf_path=args.urdf_path, device=device, voxel_dir=args.voxel_dir)
+    bbo_planner = BBOPlanner(n_func=8,domain_min=-1.0,domain_max=1.0,robot=robot_layer,device=device)
 
     contact_points = bbo_planner.contact_points
     p_l,p_r,n_l,n_r = contact_points[0],contact_points[1],contact_points[2],contact_points[3]
@@ -205,7 +212,7 @@ if __name__ == '__main__':
     torch.save(joint_conf,'joint_conf.pt')
 
     # load planned joint conf
-    data = torch.load('joint_conf.pt')
+    data = torch.load('joint_conf.pt', weights_only=False)
     theta_left = data['theta_left']
     theta_right = data['theta_right']
     print('theta_left',theta_left.shape,'theta_right',theta_right.shape)
@@ -222,13 +229,13 @@ if __name__ == '__main__':
     # # visualize the final joint configuration
     for t_l,t_r in zip(theta_left,theta_right):
         print('t left:',t_l)
-        robot_l = panda.get_forward_robot_mesh(pose_l, t_l.reshape(-1,7))[0]
+        robot_l = robot_layer.get_forward_robot_mesh(pose_l, t_l.reshape(-1,7))[0]
         robot_l = np.sum(robot_l)
         robot_l.visual.face_colors = [150,150,200,200]
         scene.add_geometry(robot_l,node_name='robot_l')
 
         print('t right:',t_r)
-        robot_r = panda.get_forward_robot_mesh(pose_r, t_r.reshape(-1,7))[0]
+        robot_r = robot_layer.get_forward_robot_mesh(pose_r, t_r.reshape(-1,7))[0]
         robot_r = np.sum(robot_r)
         robot_r.visual.face_colors = [150,200,150,200]
         scene.add_geometry(robot_r,node_name='robot_r')
@@ -236,4 +243,3 @@ if __name__ == '__main__':
 
         scene.delete_geometry('robot_l')
         scene.delete_geometry('robot_r')
-

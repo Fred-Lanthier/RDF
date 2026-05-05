@@ -14,7 +14,7 @@ import trimesh
 import utils
 import mesh_to_sdf
 import skimage
-from panda_layer.panda_layer import PandaLayer
+from urdf_layer import URDFLayer
 import argparse
 
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,20 +70,23 @@ class BPSDF():
 
     def train_bf_sdf(self,epoches=200):
         # represent SDF using basis functions
-        mesh_path = os.path.join(CUR_DIR,"panda_layer/meshes/voxel_128/*")
-        mesh_files = glob.glob(mesh_path)
-        mesh_files = sorted(mesh_files)[1:] #except finger
+        mesh_files = self.robot.get_mesh_paths()
+        mesh_names = self.robot.get_mesh_names()
         mesh_dict = {}
-        for i,mf in enumerate(mesh_files):
-            mesh_name = mf.split('/')[-1].split('.')[0]
-            mesh = trimesh.load(mf)
+        for i, (mf, mesh_name) in enumerate(zip(mesh_files, mesh_names)):
+            mesh = trimesh.load(mf, force='mesh')
+            
+            # apply internal scaling strictly from URDF scaling rules
+            scale_setting = self.robot.meshes_info[i]['scale']
+            mesh.apply_scale(scale_setting)
+
             offset = mesh.bounding_box.centroid
             scale = np.max(np.linalg.norm(mesh.vertices-offset, axis=1))
             mesh = mesh_to_sdf.scale_to_unit_sphere(mesh)
             mesh_dict[i] = {}
             mesh_dict[i]['mesh_name'] = mesh_name
             # load data
-            data = np.load(f'./data/sdf_points/voxel_128_{mesh_name}.npy',allow_pickle=True).item()
+            data = np.load(f'./data/sdf_points_xarm7/voxel_128_xarm7_{mesh_name}.npy',allow_pickle=True).item()
             point_near_data = data['near_points']
             sdf_near_data = data['near_sdf']
             point_random_data = data['random_points']
@@ -118,8 +121,8 @@ class BPSDF():
             }
         if os.path.exists(self.model_path) is False:
             os.mkdir(self.model_path)
-        torch.save(mesh_dict,f'{self.model_path}/BP_{self.n_func}.pt') # save the robot sdf model
-        print(f'{self.model_path}/BP_{self.n_func}.pt model saved!')
+        torch.save(mesh_dict,f'{self.model_path}/BP_{self.n_func}{args.file_name}_xarm7.pt') # save the robot sdf model
+        print(f'{self.model_path}/BP_{self.n_func}{args.file_name}_xarm7.pt model saved!')
 
     def sdf_to_mesh(self, model, nbData,use_derivative=False):
         verts_list, faces_list, mesh_name_list = [], [], []
@@ -164,7 +167,9 @@ class BPSDF():
                     os.mkdir(save_path)
                 trimesh.exchange.export.export_mesh(rec_mesh, os.path.join(save_path,f"{save_mesh_name}_{mesh_name}.stl"))
 
-    def get_whole_body_sdf_batch(self,x,pose,theta,model,use_derivative = True, used_links = [0,1,2,3,4,5,6,7,8],return_index=False):
+    def get_whole_body_sdf_batch(self,x,pose,theta,model,use_derivative = True, used_links = None,return_index=False):
+        if used_links is None:
+            used_links = list(range(len(model.keys())))
 
         B = len(theta)
         N = len(x)
@@ -184,29 +189,49 @@ class BPSDF():
         x_bounded = torch.where(x_bounded<-1.0+1e-2,-1.0+1e-2,x_bounded)
         res_x = x_robot_frame_batch_scaled - x_bounded
 
+        # --- DÉBUT DE LA CORRECTION D'OPTIMISATION ---
+        # 1. Modeler les poids en cube 3D pour éviter le produit tensoriel géant
+        weights_near = torch.cat([model[i]['weights'].unsqueeze(0) for i in used_links], dim=0).to(self.device)
+        W = weights_near.view(K, self.n_func, self.n_func, self.n_func)
+
+        # 2. Calculer les polynômes 1D bruts (sans les croiser)
+        p = ((x_bounded.reshape(B*K*N, 3) - self.domain_min) / (self.domain_max - self.domain_min))
+        phi, d_phi = self.build_bernstein_t(p, use_derivative)
+        
+        # phi est de taille (B*K*N, 3, n_func)
+        phi_x = phi[:, 0, :].reshape(B, K, N, self.n_func).transpose(0, 1).reshape(K, B*N, self.n_func)
+        phi_y = phi[:, 1, :].reshape(B, K, N, self.n_func).transpose(0, 1).reshape(K, B*N, self.n_func)
+        phi_z = phi[:, 2, :].reshape(B, K, N, self.n_func).transpose(0, 1).reshape(K, B*N, self.n_func)
+
+        # 3. Contraction séquentielle élégante du SDF (réduit la RAM et le CPU)
+        tmp_z = torch.einsum('k m l, k i j l -> k m i j', phi_z, W)
+        tmp_yz = torch.einsum('k m j, k m i j -> k m i', phi_y, tmp_z)
+        sdf = torch.einsum('k m i, k m i -> k m', phi_x, tmp_yz) 
+        sdf = sdf.reshape(K, B, N).transpose(0, 1).reshape(B*K, N)
+
         if not use_derivative:
-            phi,_ = self.build_basis_function_from_points(x_bounded.reshape(B*K*N,3), use_derivative=False)
-            phi = phi.reshape(B,K,N,-1).transpose(0,1).reshape(K,B*N,-1) # K,B*N,-1
-            weights_near = torch.cat([model[i]['weights'].unsqueeze(0) for i in used_links],dim=0).to(self.device)
-            # sdf
-            sdf = torch.einsum('ijk,ik->ij',phi,weights_near).reshape(K,B,N).transpose(0,1).reshape(B*K,N) # B,K,N
             sdf = sdf + res_x.norm(dim=-1)
-            sdf = sdf.reshape(B,K,N)
-            sdf = sdf*scale.reshape(B,K).unsqueeze(-1)
+            sdf = sdf.reshape(B, K, N)
+            sdf = sdf * scale.reshape(B, K).unsqueeze(-1)
             sdf_value, idx = sdf.min(dim=1)
-            if return_index:
-                return sdf_value, None, idx
             return sdf_value, None
-        else:   
-            phi,dphi = self.build_basis_function_from_points(x_bounded.reshape(B*K*N,3), use_derivative=True)
-            phi_cat = torch.cat([phi.unsqueeze(-1),dphi],dim=-1)
-            phi_cat = phi_cat.reshape(B,K,N,-1,4).transpose(0,1).reshape(K,B*N,-1,4) # K,B*N,-1,4
+        else:
+            d_phi_x = d_phi[:, 0, :].reshape(B, K, N, self.n_func).transpose(0, 1).reshape(K, B*N, self.n_func)
+            d_phi_y = d_phi[:, 1, :].reshape(B, K, N, self.n_func).transpose(0, 1).reshape(K, B*N, self.n_func)
+            d_phi_z = d_phi[:, 2, :].reshape(B, K, N, self.n_func).transpose(0, 1).reshape(K, B*N, self.n_func)
 
-            weights_near = torch.cat([model[i]['weights'].unsqueeze(0) for i in used_links],dim=0).to(self.device)
+            # Gradient X 
+            grad_x = torch.einsum('k m i, k m i -> k m', d_phi_x, tmp_yz)
+            # Gradient Y 
+            tmp_xz = torch.einsum('k m i, k m i j -> k m j', phi_x, tmp_z)
+            grad_y = torch.einsum('k m j, k m j -> k m', d_phi_y, tmp_xz)
+            # Gradient Z
+            tmp_xy = torch.einsum('k i j l, k m i -> k m j l', W, phi_x)
+            tmp_xxyy = torch.einsum('k m j l, k m j -> k m l', tmp_xy, phi_y)
+            grad_z = torch.einsum('k m l, k m l -> k m', d_phi_z, tmp_xxyy)
 
-            output = torch.einsum('ijkl,ik->ijl',phi_cat,weights_near).reshape(K,B,N,4).transpose(0,1).reshape(B*K,N,4)
-            sdf = output[:,:,0]
-            gradient = output[:,:,1:]
+            gradient = torch.stack([grad_x, grad_y, grad_z], dim=-1)
+            gradient = gradient.reshape(K, B, N, 3).transpose(0, 1).reshape(B*K, N, 3)
             # sdf
             sdf = sdf + res_x.norm(dim=-1)
             sdf = sdf.reshape(B,K,N)
@@ -230,7 +255,9 @@ class BPSDF():
                 return sdf_value, gradient_value, idx
             return sdf_value, gradient_value
 
-    def get_whole_body_sdf_with_joints_grad_batch(self,x,pose,theta,model,used_links = [0,1,2,3,4,5,6,7,8]):
+    def get_whole_body_sdf_with_joints_grad_batch(self,x,pose,theta,model,used_links = None):
+        if used_links is None:
+            used_links = list(range(len(model.keys())))
 
         delta = 0.001
         B = theta.shape[0]
@@ -243,7 +270,9 @@ class BPSDF():
         d_sdf = (sdf[:,1:,:]-sdf[:,:1,:])/delta
         return sdf[:,0,:],d_sdf.transpose(1,2)
 
-    def get_whole_body_normal_with_joints_grad_batch(self,x,pose,theta,model,used_links = [0,1,2,3,4,5,6,7,8]):
+    def get_whole_body_normal_with_joints_grad_batch(self,x,pose,theta,model,used_links = None):
+        if used_links is None:
+            used_links = list(range(len(model.keys())))
         delta = 0.001
         B = theta.shape[0]
         theta = theta.unsqueeze(1)
@@ -261,28 +290,34 @@ if __name__ =='__main__':
     parser.add_argument('--domain_max', default=1.0, type=float)
     parser.add_argument('--domain_min', default=-1.0, type=float)
     parser.add_argument('--n_func', default=8, type=int)
+    parser.add_argument('--file_name', type=str, default='')
     parser.add_argument('--train', action='store_true')
+    parser.add_argument('--urdf_path', default='./collision_avoidance_example/xarm7_urdf/xarm7_FT_EE.urdf', type=str)
+    parser.add_argument('--voxel_dir', default='./panda_layer/meshes/voxel_128_xarm7', type=str)
     args = parser.parse_args()
 
-    panda = PandaLayer(args.device)
-    bp_sdf = BPSDF(args.n_func,args.domain_min,args.domain_max,panda,args.device)
+    # ensure users can dynamically swap robots
+    robot_layer = URDFLayer(urdf_path=args.urdf_path, device=args.device, voxel_dir=args.voxel_dir)
+    bp_sdf = BPSDF(args.n_func,args.domain_min,args.domain_max,robot_layer,args.device)
     
-    # #  train Bernstein Polynomial model   
+    # train Bernstein Polynomial model
+    print(args.file_name)   
     if args.train:
+        print(args.file_name)
         bp_sdf.train_bf_sdf()
 
     # load trained model
-    model_path = f'models/BP_{args.n_func}.pt'
-    model = torch.load(model_path)
+    model_path = f'models/BP_{args.n_func}{args.file_name}_xarm7.pt'
+    model = torch.load(model_path, weights_only=False)
     
     # visualize the Bernstein Polynomial model for each robot link
-    bp_sdf.create_surface_mesh(model,nbData=128,vis=True,save_mesh_name=f'BP_{args.n_func}')
+    bp_sdf.create_surface_mesh(model,nbData=128,vis=True,save_mesh_name=f'BP_{args.n_func}{args.file_name}_xarm7')
 
     # visualize the Bernstein Polynomial model for the whole body
     theta = torch.tensor([0, -0.3, 0, -2.2, 0, 2.0, np.pi/4]).float().to(args.device).reshape(-1,7)
     pose = torch.from_numpy(np.identity(4)).to(args.device).reshape(-1, 4, 4).expand(len(theta),4,4).float()
-    trans_list = panda.get_transformations_each_link(pose,theta)
-    utils.visualize_reconstructed_whole_body(model, trans_list, tag=f'BP_{args.n_func}')
+    trans_list = robot_layer.get_transformations_each_link(pose,theta)
+    utils.visualize_reconstructed_whole_body(model, trans_list, tag=f'BP_{args.n_func}{args.file_name}_xarm7', mesh_names=robot_layer.get_mesh_names())
     
     # run RDF 
     x = torch.rand(128,3).to(args.device)*2.0 - 1.0

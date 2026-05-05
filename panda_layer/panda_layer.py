@@ -250,77 +250,67 @@ class PandaLayer(torch.nn.Module):
                 link3_normals, link4_normals, link5_normals, \
                 link6_normals, link7_normals, link8_normals]
 
-    def get_transformations_each_link(self,pose, theta):
+    def get_transformations_each_link(self, pose, theta):
         batch_size = theta.shape[0]
-        T01 = self.forward_kinematics(self.A0, torch.tensor(0, dtype=torch.float32, device=self.device),
-                                      0.333, theta[:, 0], batch_size).float()
 
-        # link2_vertices = self.link2.repeat(batch_size, 1, 1)
-        T12 = self.forward_kinematics(self.A1, torch.tensor(-np.pi/2., dtype=torch.float32, device=self.device),
-                                      0, theta[:, 1], batch_size).float()
-        # link3_vertices = self.link3.repeat(batch_size, 1, 1)
-        T23 = self.forward_kinematics(self.A2, torch.tensor(np.pi/2., dtype=torch.float32, device=self.device),
-                                      0.316, theta[:, 2], batch_size).float()
-        # link4_vertices = self.link4.repeat(batch_size, 1, 1)
-        T34 = self.forward_kinematics(self.A3, torch.tensor(np.pi/2., dtype=torch.float32, device=self.device),
-                                      0, theta[:, 3], batch_size).float()
-        # link5_vertices = self.link5.repeat(batch_size, 1, 1)
-        T45 = self.forward_kinematics(self.A4, torch.tensor(-np.pi/2., dtype=torch.float32, device=self.device),
-                                      0.384, theta[:, 4], batch_size).float()
-        # link6_vertices = self.link6.repeat(batch_size, 1, 1)
-        T56 = self.forward_kinematics(self.A5, torch.tensor(np.pi/2., dtype=torch.float32, device=self.device),
-                                      0, theta[:, 5], batch_size).float()
-        # link7_vertices = self.link7.repeat(batch_size, 1, 1)
-        T67 = self.forward_kinematics(self.A6, torch.tensor(np.pi/2., dtype=torch.float32, device=self.device),
-                                      0, theta[:, 6], batch_size).float()
-        # link8_vertices = self.link8.repeat(batch_size, 1, 1)
-        T78 = self.forward_kinematics(self.A7, torch.tensor(0, dtype=torch.float32, device=self.device),
-                                      0.107, -np.pi/4*torch.ones_like(theta[:,0],device=self.device), batch_size).float()
-        # finger_vertices = self.finger.repeat(batch_size, 1, 1)
-        pose_to_Tw0 = pose
-        pose_to_T01 = torch.matmul(pose_to_Tw0, T01)
-        pose_to_T12 = torch.matmul(pose_to_T01, T12)
-        pose_to_T23 = torch.matmul(pose_to_T12, T23)
-        pose_to_T34 = torch.matmul(pose_to_T23, T34)
-        pose_to_T45 = torch.matmul(pose_to_T34, T45)
-        pose_to_T56 = torch.matmul(pose_to_T45, T56)
-        pose_to_T67 = torch.matmul(pose_to_T56, T67)
-        pose_to_T78 = torch.matmul(pose_to_T67, T78)
+        # Plus AUCUN appel à `torch.tensor()` ici. On passe des floats natifs Python !
+        T01 = self.forward_kinematics(self.A0, 0.0, 0.333, theta[:, 0], batch_size)
+        T12 = self.forward_kinematics(self.A1, -math.pi/2.0, 0.0, theta[:, 1], batch_size)
+        T23 = self.forward_kinematics(self.A2, math.pi/2.0, 0.316, theta[:, 2], batch_size)
+        T34 = self.forward_kinematics(self.A3, math.pi/2.0, 0.0, theta[:, 3], batch_size)
+        T45 = self.forward_kinematics(self.A4, -math.pi/2.0, 0.384, theta[:, 4], batch_size)
+        T56 = self.forward_kinematics(self.A5, math.pi/2.0, 0.0, theta[:, 5], batch_size)
+        T67 = self.forward_kinematics(self.A6, math.pi/2.0, 0.0, theta[:, 6], batch_size)
 
-        return [pose_to_Tw0,pose_to_T01,pose_to_T12,pose_to_T23,pose_to_T34,pose_to_T45,pose_to_T56,pose_to_T67,pose_to_T78]
+        # Pour le dernier joint, on réutilise un tenseur existant pour éviter l'allocation dynamique
+        theta7 = -math.pi/4.0 * torch.ones_like(theta[:, 0])
+        T78 = self.forward_kinematics(self.A7, 0.0, 0.107, theta7, batch_size)
+
+        # Optimisation : bmm (Batch Matrix Multiply) est plus rapide que matmul
+        pose_to_T01 = torch.bmm(pose, T01)
+        pose_to_T12 = torch.bmm(pose_to_T01, T12)
+        pose_to_T23 = torch.bmm(pose_to_T12, T23)
+        pose_to_T34 = torch.bmm(pose_to_T23, T34)
+        pose_to_T45 = torch.bmm(pose_to_T34, T45)
+        pose_to_T56 = torch.bmm(pose_to_T45, T56)
+        pose_to_T67 = torch.bmm(pose_to_T56, T67)
+        pose_to_T78 = torch.bmm(pose_to_T67, T78)
+
+        return [pose, pose_to_T01, pose_to_T12, pose_to_T23, pose_to_T34, pose_to_T45, pose_to_T56, pose_to_T67, pose_to_T78]
+
+    def forward_kinematics(self, A, alpha, D, theta, batch_size=1):
+        # 1. On utilise le module `math` natif pour les constantes
+        c_alpha = math.cos(alpha)
+        s_alpha = math.sin(alpha)
+
+        theta = theta.view(batch_size)
+        c_theta = torch.cos(theta)
+        s_theta = torch.sin(theta)
+
+        # 2. Allocation in-place compatible avec CUDA Graphs
+        # new_zeros hérite directement du device et du type du tenseur 'theta'
+        T = theta.new_zeros((batch_size, 4, 4))
+
+        T[:, 0, 0] = c_theta
+        T[:, 0, 1] = -s_theta
+        T[:, 0, 3] = A
+        T[:, 1, 0] = s_theta * c_alpha
+        T[:, 1, 1] = c_theta * c_alpha
+        T[:, 1, 2] = -s_alpha
+        T[:, 1, 3] = -s_alpha * D
+        T[:, 2, 0] = s_theta * s_alpha
+        T[:, 2, 1] = c_theta * s_alpha
+        T[:, 2, 2] = c_alpha
+        T[:, 2, 3] = c_alpha * D
+        T[:, 3, 3] = 1.0
+
+        return T
 
     def get_eef(self,pose, theta,link=-1):
         poses = self.get_transformations_each_link(pose, theta)
         pos = poses[link][:, :3, 3]
         rot = poses[link][:, :3, :3]
         return  pos, rot
-
-    def forward_kinematics(self, A, alpha, D, theta, batch_size=1):
-        theta = theta.view(batch_size, -1)
-        alpha = alpha*torch.ones_like(theta)
-        c_theta = torch.cos(theta)
-        s_theta = torch.sin(theta)
-        c_alpha = torch.cos(alpha)
-        s_alpha = torch.sin(alpha)
-
-        l_1_to_l = torch.cat([c_theta, -s_theta, torch.zeros_like(s_theta), A * torch.ones_like(c_theta),
-                                s_theta * c_alpha, c_theta * c_alpha, -s_alpha, -s_alpha * D,
-                                s_theta * s_alpha, c_theta * s_alpha, c_alpha, c_alpha * D,
-                                torch.zeros_like(s_theta), torch.zeros_like(s_theta), torch.zeros_like(s_theta), torch.ones_like(s_theta)], dim=1).reshape(batch_size, 4, 4)
-        # l_1_to_l = torch.zeros((batch_size, 4, 4), device=self.device)
-        # l_1_to_l[:, 0, 0] = c_theta
-        # l_1_to_l[:, 0, 1] = -s_theta
-        # l_1_to_l[:, 0, 3] = A
-        # l_1_to_l[:, 1, 0] = s_theta * c_alpha
-        # l_1_to_l[:, 1, 1] = c_theta * c_alpha
-        # l_1_to_l[:, 1, 2] = -s_alpha
-        # l_1_to_l[:, 1, 3] = -s_alpha * D
-        # l_1_to_l[:, 2, 0] = s_theta * s_alpha
-        # l_1_to_l[:, 2, 1] = c_theta * s_alpha
-        # l_1_to_l[:, 2, 2] = c_alpha
-        # l_1_to_l[:, 2, 3] = c_alpha * D
-        # l_1_to_l[:, 3, 3] = 1
-        return l_1_to_l
 
     def get_robot_mesh(self, vertices_list, faces):
 

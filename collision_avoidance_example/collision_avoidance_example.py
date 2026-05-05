@@ -30,7 +30,7 @@ from panda_layer.panda_layer import PandaLayer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 robot = PandaLayer(device)
 bp_sdf = bf_sdf.BPSDF(8,-1.0,1.0,robot,device)
-bp_sdf_model = torch.load(os.path.join(CUR_PATH,'../models/BP_8.pt'))
+bp_sdf_model = torch.load(os.path.join(CUR_PATH,'../models/BP_8.pt'), weights_only=False)
 
 def main_loop():
 
