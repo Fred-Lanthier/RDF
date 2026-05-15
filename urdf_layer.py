@@ -91,6 +91,21 @@ class URDFLayer(torch.nn.Module):
             self._extract_tree(child)
 
     def _resolve_mesh_path(self, raw_path):
+        import rospkg
+        rospack = rospkg.RosPack()
+        
+        # 1. Expand ROS package:// URIs
+        if raw_path.startswith('package://'):
+            parts = raw_path[10:].split('/', 1)
+            pkg_name = parts[0]
+            rel_path = parts[1] if len(parts) > 1 else ''
+            try:
+                pkg_dir = rospack.get_path(pkg_name)
+                raw_path = os.path.join(pkg_dir, rel_path)
+            except rospkg.ResourceNotFound:
+                pass # Fallback to manual resolution below
+
+        # 2. Force voxel directory override if requested
         if self.voxel_dir is not None:
             basename = os.path.basename(raw_path)
             name_no_ext = os.path.splitext(basename)[0]
@@ -102,7 +117,12 @@ class URDFLayer(torch.nn.Module):
             for candidate in voxel_candidates:
                 if os.path.isfile(candidate):
                     return candidate
-        if raw_path.startswith('package://'):
+
+        if os.path.isfile(raw_path):
+            return raw_path
+
+        # 3. Last ditch fallback (manual path stripping)
+        if 'package://' in raw_path:
             relative = raw_path.replace('package://', '')
             p1 = os.path.normpath(os.path.join(self.package_dir, relative))
             if os.path.exists(p1): return p1
