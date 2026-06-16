@@ -212,6 +212,50 @@ class URDFLayer(torch.nn.Module):
             
         return poses
 
+    def make_fk_subset(self, target_links):
+        """Return the topologically ordered joint subset needed for target_links."""
+        parent_by_child = {
+            joint['child_link']: joint['parent_link']
+            for joint in self.kinematic_tree
+        }
+        needed_links = set(target_links)
+        for target in target_links:
+            link = target
+            while link in parent_by_child:
+                parent = parent_by_child[link]
+                needed_links.add(parent)
+                link = parent
+
+        return [
+            joint for joint in self.kinematic_tree
+            if joint['child_link'] in needed_links
+        ]
+
+    def _native_forward_kinematics_subset(self, theta, joint_subset):
+        batch_shape = theta.shape[:-1]
+        poses = {}
+        poses[self.chain._root.link.name] = torch.eye(
+            4, device=self.device, dtype=theta.dtype).expand(*batch_shape, 4, 4)
+
+        for joint in joint_subset:
+            T_offset = joint['offset'].expand(*batch_shape, 4, 4).to(dtype=theta.dtype)
+
+            if joint['type'] in ['revolute', 'continuous']:
+                q = theta[..., joint['idx']]
+                T_joint = self._build_revolute(joint['K'], joint['K_sq'], q)
+                T_local = T_offset @ T_joint
+            elif joint['type'] == 'prismatic':
+                q = theta[..., joint['idx']]
+                T_joint = self._build_prismatic(joint['axis'], q)
+                T_local = T_offset @ T_joint
+            else:
+                T_local = T_offset
+
+            T_parent = poses[joint['parent_link']]
+            poses[joint['child_link']] = T_parent @ T_local
+
+        return poses
+
     def get_transformations_each_link(self, pose, theta):
         # Padding Dynamique sans forcer la dimension B
         if theta.shape[-1] < self.dof:
